@@ -39,6 +39,7 @@
 """GPTQ helper and Hessian utilities for calibration."""
 
 import math
+import time
 
 import torch
 
@@ -229,6 +230,10 @@ class GPTQHelper:
         else:
             gptq_blockwise_update(self.weight, self.h_inv, block_size, quantizer)
 
+    #: Progress bookkeeping for the solve loop; see :meth:`_print_mse_error`.
+    _solved_count = 0
+    _solve_start: float | None = None
+
     def _print_mse_error(self, hessian):
         """Log Hessian-weighted relative MSE between ``self.weight`` and original weights."""
         w_orig = self.module.weight.float()
@@ -236,6 +241,16 @@ class GPTQHelper:
         mse = (delta).mm(hessian).mul(delta).mean() / (w_orig.mm(hessian).mul(w_orig).mean() + 1e-6)
         suffix = f", n_hessian_samples: {self.n_samples}" if self.n_samples else ""
         print_rank_0(f"[{self.name}] Relative MSE error: {mse.item():.2e}{suffix}")
+        # Solving all modules can take hours under FSDP2 (per-layer unshard);
+        # surface a cumulative rate so long runs don't look hung.
+        GPTQHelper._solved_count += 1
+        if GPTQHelper._solve_start is None:
+            GPTQHelper._solve_start = time.time()
+        elapsed = time.time() - GPTQHelper._solve_start
+        print_rank_0(
+            f"[gptq] layers solved: {GPTQHelper._solved_count} "
+            f"({GPTQHelper._solved_count / max(elapsed, 1) * 60:.1f}/min, {elapsed:.0f}s elapsed)"
+        )
 
 
 def gptq_blockwise_update(weight, h_inv, block_size, quantize_fn):
