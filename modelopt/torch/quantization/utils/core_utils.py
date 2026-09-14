@@ -520,7 +520,6 @@ def _fsdp2_unshard_context(fsdp_module: FSDPModule):
             fsdp_module.reshard()
 
 
-@contextmanager
 def _release_cached_cuda_blocks(min_cached: int = 2**30) -> None:
     """Return cached-but-unallocated blocks to the driver, if there are many.
 
@@ -541,6 +540,7 @@ def _release_cached_cuda_blocks(min_cached: int = 2**30) -> None:
         torch.cuda.empty_cache()
 
 
+@contextmanager
 def fsdp2_weight_access_and_writeback_context(
     module: nn.Module, root_model: nn.Module, writeback: bool = True
 ):

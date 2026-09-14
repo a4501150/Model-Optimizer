@@ -130,6 +130,14 @@ class GPTQHelper:
 
     CACHE_NAME = "_forward_no_gptq_hessian"
 
+    #: GPU-memory fraction above which ``offload_to_cpu=True`` places the
+    #: Hessian on CPU instead of the module's device. A class attribute (not a
+    #: literal) so callers can pin placement before a collection pass: the
+    #: fraction is read *at allocation time*, before the pass that grows GPU
+    #: usage, so peak-time OOMs can trace back to an optimistic early
+    #: decision. Set to 0.0 to force CPU placement, 1.0 to keep on device.
+    HESSIAN_OFFLOAD_FRACTION: float = 0.65
+
     def __init__(self, module, name, offload_to_cpu=False, fused=False):
         """Initialize GPTQHelper with module state and Hessian storage."""
         self.module = module
@@ -137,7 +145,9 @@ class GPTQHelper:
         self.fused = fused
         in_features = module.weight.shape[-1]
         device = module.weight.device
-        if device.type == "meta" or (offload_to_cpu and get_used_gpu_mem_fraction(device) > 0.65):
+        if device.type == "meta" or (
+            offload_to_cpu and get_used_gpu_mem_fraction(device) > self.HESSIAN_OFFLOAD_FRACTION
+        ):
             device = "cpu"
         self.hessian = torch.zeros(in_features, in_features, dtype=torch.float32, device=device)
         self.n_samples = 0
