@@ -439,9 +439,24 @@ def _get_fsdp2_mesh(module: nn.Module):
 
 
 def _get_module_name(module: nn.Module, root_model: nn.Module, name_to_module: dict | None = None):
+    # Memoize the resolved name on the module: the weight-update paths (GPTQ solve,
+    # export requantize) query once per weight, so rebuilding the root's
+    # ``named_modules()`` map on every call is quadratic for wide-MoE graphs
+    # (~50k updates x ~200k-node walks). The cached name is validated against
+    # ``root_model`` before use, so renames or dynamic re-wrapping fall back to a
+    # fresh lookup instead of returning a stale path.
+    cached = module.__dict__.get("_modelopt_module_name")
+    if cached is not None:
+        try:
+            if root_model.get_submodule(cached) is module:
+                return cached
+        except AttributeError:
+            pass
     if name_to_module is None:
         name_to_module = dict(root_model.named_modules())
     target_module_name = next((name for name, m in name_to_module.items() if m is module), None)
+    if target_module_name is not None:
+        module.__dict__["_modelopt_module_name"] = target_module_name
     return target_module_name
 
 
