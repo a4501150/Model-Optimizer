@@ -521,6 +521,26 @@ def _fsdp2_unshard_context(fsdp_module: FSDPModule):
 
 
 @contextmanager
+def _release_cached_cuda_blocks(min_cached: int = 2**30) -> None:
+    """Return cached-but-unallocated blocks to the driver, if there are many.
+
+    The weight-access windows briefly materialize full-layer replicas; under
+    ``expandable_segments`` the physical mappings linger afterwards and the
+    next window's all-gather can OOM despite the replicas being gone.
+    ``empty_cache()`` unconditionally is too expensive at the per-update call
+    sites (tens of thousands of windows), so only run it when the allocator
+    is actually sitting on >= ``min_cached`` reclaimable bytes.
+    """
+    if not torch.cuda.is_available():
+        return
+    stats = torch.cuda.memory_stats()
+    cached = stats.get("reserved_bytes.all.current", 0) - stats.get(
+        "allocated_bytes.all.current", 0
+    )
+    if cached >= min_cached:
+        torch.cuda.empty_cache()
+
+
 def fsdp2_weight_access_and_writeback_context(
     module: nn.Module, root_model: nn.Module, writeback: bool = True
 ):
@@ -597,6 +617,7 @@ def fsdp2_weight_access_and_writeback_context(
                 ).to_local()
             )
             _set_parameter(module, name, original_param)
+        _release_cached_cuda_blocks()
 
 
 @contextmanager
@@ -1055,6 +1076,7 @@ def fsdp2_aware_weight_update(root_model, modules_to_update, reshard=True):
             if reshard:
                 with enable_fake_quant(root_module):
                     root_module.reshard()
+            _release_cached_cuda_blocks()
 
 
 def update_quant_cfg_with_kv_cache_quant(
