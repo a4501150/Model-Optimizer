@@ -892,6 +892,12 @@ def _warn_on_unsynced_moe_gate_up(model: nn.Module) -> None:
         )
 
 
+#: Param classes whose meta downgrade failed on non-zero ranks (kept CUDA,
+#: reported once so the odd shape is visible in the export log instead of
+#: silently costing host memory).
+_CUDA_KEPT_ON_NONZERO_RANK: set[str] = set()
+
+
 def _offload_export_outputs(module: nn.Module) -> None:
     """Move freshly exported tensors of a processed FSDP unit to host memory.
 
@@ -932,16 +938,32 @@ def _offload_export_outputs(module: nn.Module) -> None:
             meta = torch.empty_strided(
                 tuple(param.shape), param.stride(), dtype=param.dtype, device="meta"
             )
+            mod_name, _, attr = name.rpartition(".")
+            parent = module.get_submodule(mod_name) if mod_name else module
             if isinstance(param, QTensorWrapper):
                 # ``param.data = meta`` is rejected on a subclassed Parameter
                 # (set_data requires the same tensor type; 2026-09-15 +sq5 run:
                 # "incompatible tensor type"), so replace the instance with a
                 # fresh wrapper over the meta storage, metadata intact.
-                mod_name, _, attr = name.rpartition(".")
-                parent = module.get_submodule(mod_name) if mod_name else module
                 parent._parameters[attr] = QTensorWrapper(meta, metadata=param.metadata)
             else:
-                param.data = meta
+                # +sq6 died here: some non-fused-path params are qtensor
+                # subclasses too and reject the plain-meta swap (+sq7 run: the
+                # first non-fused FSDP unit killed every non-zero rank at its
+                # boundary, rank 0 then hung on the peer-less unshard). Try the
+                # swap, then a same-class meta downgrade, then leave the tensor
+                # on-device (correct, just memory-costly) — but never raise:
+                # a throw here deadlocks the export against the barrier.
+                try:
+                    param.data = meta
+                except Exception:  # noqa: BLE001
+                    try:
+                        parent._parameters[attr] = param.new_meta()
+                    except Exception:  # noqa: BLE001
+                        cls_name = type(param).__name__
+                        if cls_name not in _CUDA_KEPT_ON_NONZERO_RANK:
+                            print(f"[offload] rank kept {cls_name} on device (meta downgrade failed)")
+                        _CUDA_KEPT_ON_NONZERO_RANK.add(cls_name)
     for _, buf in module.named_buffers():
         if buf.device.type == "cuda" and not isinstance(buf, DTensor):
             buf.data = buf.detach().cpu()
@@ -1706,8 +1728,14 @@ def export_hf_checkpoint(
         _write_hf_export_config(model, hf_quant_config, export_dir)
 
     except Exception as e:
+        # Print NOW, not after the finally-barrier: the traceback only surfaces
+        # once every rank reaches the barrier, so one failing rank otherwise
+        # deadlocks the log for the whole timeout window and hides the cause
+        # (2026-09-15 prod runs 4-5).
+        print(f"[export] rank failed: {type(e).__name__}: {e}", flush=True)
         warnings.warn(
-            "Cannot export model to the model_config. The modelopt-optimized model state_dict"
+            f"Cannot export model to the model_config ({type(e).__name__}: {e})."
+            " The modelopt-optimized model state_dict"
             " can be saved with torch.save for further inspection."
         )
         raise e
