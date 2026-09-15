@@ -908,10 +908,30 @@ def _offload_export_outputs(module: nn.Module) -> None:
 
     DTensor params are skipped: they are unprocessed layers' shards, which the
     later unshard windows still need on-device.
+
+    Only rank 0 may keep the *values*: :func:`export_hf_checkpoint` returns
+    non-zero ranks just before the save, and ``get_model_state_dict()`` passes
+    plain (already-gathered) params through as-is, so a full CPU copy per rank
+    multiplies host usage by world size — the 2026-09-14 prod rerun OOMKilled
+    its 900 Gi container cgroup on ~8x-duplicated export outputs plus the PLE
+    tmpfs. Non-zero ranks downgrade params to meta tensors (shape/stride/dtype
+    preserved, no storage); their buffers stay on host (small, and
+    :func:`postprocess_state_dict` calls ``.item()`` on some of them on every
+    rank).
     """
+    keep_values = not (
+        torch.distributed.is_available()
+        and torch.distributed.is_initialized()
+        and torch.distributed.get_rank() != 0
+    )
     for _, param in module.named_parameters():
         if param.device.type == "cuda" and not isinstance(param, DTensor):
-            param.data = param.detach().cpu()
+            if keep_values:
+                param.data = param.detach().cpu()
+            else:
+                param.data = torch.empty_strided(
+                    tuple(param.shape), param.stride(), dtype=param.dtype, device="meta"
+                )
     for _, buf in module.named_buffers():
         if buf.device.type == "cuda" and not isinstance(buf, DTensor):
             buf.data = buf.detach().cpu()
