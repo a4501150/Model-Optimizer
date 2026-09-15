@@ -924,14 +924,24 @@ def _offload_export_outputs(module: nn.Module) -> None:
         and torch.distributed.is_initialized()
         and torch.distributed.get_rank() != 0
     )
-    for _, param in module.named_parameters():
+    for name, param in list(module.named_parameters()):
         if param.device.type == "cuda" and not isinstance(param, DTensor):
             if keep_values:
                 param.data = param.detach().cpu()
+                continue
+            meta = torch.empty_strided(
+                tuple(param.shape), param.stride(), dtype=param.dtype, device="meta"
+            )
+            if isinstance(param, QTensorWrapper):
+                # ``param.data = meta`` is rejected on a subclassed Parameter
+                # (set_data requires the same tensor type; 2026-09-15 +sq5 run:
+                # "incompatible tensor type"), so replace the instance with a
+                # fresh wrapper over the meta storage, metadata intact.
+                mod_name, _, attr = name.rpartition(".")
+                parent = module.get_submodule(mod_name) if mod_name else module
+                parent._parameters[attr] = QTensorWrapper(meta, metadata=param.metadata)
             else:
-                param.data = torch.empty_strided(
-                    tuple(param.shape), param.stride(), dtype=param.dtype, device="meta"
-                )
+                param.data = meta
     for _, buf in module.named_buffers():
         if buf.device.type == "cuda" and not isinstance(buf, DTensor):
             buf.data = buf.detach().cpu()
