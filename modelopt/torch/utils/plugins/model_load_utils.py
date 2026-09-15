@@ -218,7 +218,7 @@ def build_meta_causal_lm(
     dtype = getattr(hf_config, "torch_dtype", None) or torch.bfloat16
     with init_empty_weights(include_buffers=False):
         model = AutoModelForCausalLM.from_config(
-            hf_config, torch_dtype=dtype, trust_remote_code=trust_remote_code
+            hf_config, dtype=dtype, trust_remote_code=trust_remote_code
         )
     model.eval()
     return model
