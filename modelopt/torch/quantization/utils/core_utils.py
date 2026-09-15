@@ -985,6 +985,10 @@ def fsdp2_aware_weight_update(root_model, modules_to_update, reshard=True):
     Returns:
         None
     """
+    # Bound before ``try`` so a raise inside the unshard/mapping setup (e.g. CUDA
+    # OOM in root_module.unshard()) cannot turn the cleanup in ``finally`` into
+    # an UnboundLocalError that masks the original error (seen 2026-09-14).
+    fsdp_param_mapping = None
     try:
         if isinstance(root_model, FSDPModule):
             # Get FSDP root module, if none is returned, then the update is not made to a submodule of an FSDPModule
@@ -1027,7 +1031,7 @@ def fsdp2_aware_weight_update(root_model, modules_to_update, reshard=True):
     finally:
         from modelopt.torch.quantization.qtensor.base_qtensor import QFSDPParam, QTensorWrapper
 
-        if isinstance(root_model, FSDPModule):
+        if isinstance(root_model, FSDPModule) and fsdp_param_mapping is not None:
             # Update FSDPParam list
             for module in modules_to_update:
                 for param_name, param in module.named_parameters():
@@ -1076,7 +1080,10 @@ def fsdp2_aware_weight_update(root_model, modules_to_update, reshard=True):
             if reshard:
                 with enable_fake_quant(root_module):
                     root_module.reshard()
-            _release_cached_cuda_blocks()
+        # Outside the mapping guard: on the early-raise path this is exactly
+        # when partially built unshard buffers should be reclaimed (the call is
+        # itself gated on ≥2 GiB reclaimable).
+        _release_cached_cuda_blocks()
 
 
 def update_quant_cfg_with_kv_cache_quant(
