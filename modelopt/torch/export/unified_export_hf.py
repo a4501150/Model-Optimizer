@@ -947,23 +947,24 @@ def _offload_export_outputs(module: nn.Module) -> None:
                 # fresh wrapper over the meta storage, metadata intact.
                 parent._parameters[attr] = QTensorWrapper(meta, metadata=param.metadata)
             else:
-                # +sq6 died here: some non-fused-path params are qtensor
-                # subclasses too and reject the plain-meta swap (+sq7 run: the
-                # first non-fused FSDP unit killed every non-zero rank at its
-                # boundary, rank 0 then hung on the peer-less unshard). Try the
-                # swap, then a same-class meta downgrade, then leave the tensor
-                # on-device (correct, just memory-costly) — but never raise:
-                # a throw here deadlocks the export against the barrier.
+                # +sq7 run: plain nn.Parameters holding the quantized payload
+                # reject ``set_data`` with a symbolic (meta) tensor AND do not
+                # support new_meta(); keeping them CUDA made every non-zero
+                # rank OOM at the next unshard. Replace the instance with a
+                # meta-constructed Parameter — construction on the meta device
+                # is supported even though in-place swap is not. Non-main
+                # values are discarded before the save; the FSDP param rebuild
+                # for this unit already happened in the handler.
                 try:
-                    param.data = meta
+                    parent._parameters[attr] = nn.Parameter(meta, requires_grad=False)
                 except Exception:  # noqa: BLE001
-                    try:
-                        parent._parameters[attr] = param.new_meta()
-                    except Exception:  # noqa: BLE001
-                        cls_name = type(param).__name__
-                        if cls_name not in _CUDA_KEPT_ON_NONZERO_RANK:
-                            print(f"[offload] rank kept {cls_name} on device (meta downgrade failed)")
-                        _CUDA_KEPT_ON_NONZERO_RANK.add(cls_name)
+                    # Bare meta tensor as last resort (dict accepts non-Parameter
+                    # tensors); never leave a CUDA tensor behind here.
+                    cls_name = type(param).__name__
+                    if cls_name not in _CUDA_KEPT_ON_NONZERO_RANK:
+                        print(f"[offload] bare meta tensor replaces {cls_name}")
+                    _CUDA_KEPT_ON_NONZERO_RANK.add(cls_name)
+                    parent._parameters[attr] = meta
     for _, buf in module.named_buffers():
         if buf.device.type == "cuda" and not isinstance(buf, DTensor):
             buf.data = buf.detach().cpu()
