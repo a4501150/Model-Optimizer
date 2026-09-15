@@ -53,6 +53,7 @@ except ImportError:
 
 from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
 from torch.distributed.fsdp import FSDPModule
+from torch.distributed.tensor import DTensor
 
 from modelopt.torch.quantization import set_quantizer_by_cfg_context
 from modelopt.torch.quantization.nn import SequentialQuantizer, TensorQuantizer
@@ -891,6 +892,31 @@ def _warn_on_unsynced_moe_gate_up(model: nn.Module) -> None:
         )
 
 
+def _offload_export_outputs(module: nn.Module) -> None:
+    """Move freshly exported tensors of a processed FSDP unit to host memory.
+
+    :func:`_export_quantized_weight` replaces each processed module's sharded
+    DTensor with the full quantized tensor built inside the unshard window — a
+    plain CUDA tensor (QTensorWrapper packed bytes) plus registered scale
+    buffers. Nothing reads them on-device again: requantize/resmooth has
+    already run, and the safetensors write happens once at the end. Left in
+    place, one full quantized layer per processed decoder layer accumulates on
+    the GPU; on an 80 GiB H100 that growth reaches OOM at the next unshard's
+    all-gather allocation (measured 2026-09-14 with ``_record_memory_history``:
+    the holders are exactly the ``nvfp4_tensor.quantize`` outputs and their
+    fp8 block-scale temporaries, ~36 GiB at OOM).
+
+    DTensor params are skipped: they are unprocessed layers' shards, which the
+    later unshard windows still need on-device.
+    """
+    for _, param in module.named_parameters():
+        if param.device.type == "cuda" and not isinstance(param, DTensor):
+            param.data = param.detach().cpu()
+    for _, buf in module.named_buffers():
+        if buf.device.type == "cuda" and not isinstance(buf, DTensor):
+            buf.data = buf.detach().cpu()
+
+
 def _process_quantized_modules(
     model: nn.Module,
     dtype: torch.dtype,
@@ -918,11 +944,22 @@ def _process_quantized_modules(
             # We need to reshard the previous FSDPModule to prevent potential OOM.
             # This hack reduces the number of unshard reshard operations, to avoid unnecessary communication.
             if fsdp_module_to_reshard is not None:
+                _offload_export_outputs(fsdp_module_to_reshard)
                 fsdp_module_to_reshard.reshard()
+                torch.cuda.empty_cache()
 
             fsdp_module_to_reshard = sub_module
 
         _dispatch_export_handler(name, sub_module, ctx)
+
+    if fsdp_module_to_reshard is not None:
+        # Last FSDP unit: the loop above only hands off the *previous* unit at
+        # each boundary, so without this the tail layer's unshard buffers and
+        # export outputs would stay resident through the final state-dict
+        # write (measured 4.7 GiB of still-active all-gather outputs).
+        _offload_export_outputs(fsdp_module_to_reshard)
+        fsdp_module_to_reshard.reshard()
+        torch.cuda.empty_cache()
 
 
 def _export_transformers_checkpoint(
